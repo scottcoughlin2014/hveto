@@ -772,3 +772,4 @@ def write_about_page(configfile):
     page.h2('Configuration')
     page.pre(write_config_html(configfile))
     return page
+

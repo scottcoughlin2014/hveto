@@ -57,7 +57,9 @@ from hveto.segments import (write_ascii as write_ascii_segments,
                             read_veto_definer_file)
 from hveto.triggers import (get_triggers, find_auxiliary_channels,
                             get_column_label)
+from hveto.safety import safety_calc
 from astropy.table.column import MaskedColumn
+from astropy.time import Time
 
 IFO = os.getenv('IFO')
 
@@ -104,7 +106,7 @@ parser.add_argument('-S', '--analysis-segments', action='append', default=[],
 parser.add_argument('-w', '--omega-scans', type=int, metavar='NSCAN',
                     help='generate a workflow of omega scans for each round, '
                          'requires the gwdetchar package')
-
+parser.add_argument('--safety', action='store_true', help='Safety study mode.')
 pout = parser.add_argument_group('Output options')
 pout.add_argument('-o', '--output-directory', default=os.curdir,
                   help='path of output directory, default: %(default)s')
@@ -115,11 +117,17 @@ ifo = args.ifo
 start = int(args.gpsstart)
 end = int(args.gpsend)
 duration = end - start
+is_safety  = args.safety
+safety_cutoff = None
+safety_plot_count = None
+
 
 logger.info("-- Welcome to Hveto --")
 logger.info("GPS start time: %d" % start)
 logger.info("GPS end time: %d" % end)
 logger.info("Interferometer: %s" % ifo)
+if is_safety:
+    logger.info("-- Safety  study protocol --")
 
 # -- initialisation -----------------------------------------------------------
 
@@ -143,8 +151,10 @@ for d in [segdir, plotdir, trigdir, omegadir]:
         os.makedirs(d)
 
 # prepare html variables
+title_txt = '%s Hveto | %d-%d' % (ifo, start, end)
+
 htmlv = {
-    'title': '%s Hveto | %d-%d' % (ifo, start, end),
+    'title': title_txt,
     'config': None,
 }
 
@@ -163,6 +173,10 @@ if args.analysis_segments:
     analysis.known &= span
     analysis.coalesce()
     logger.debug("Segments read from disk")
+elif is_safety:
+    span = SegmentList([Segment(start, end)])
+    analysis = DataQualityFlag(name='Manual',active=span, known=span, label='Safety injection')
+    logger.debug("Segment created from start-end")
 else:
     analysis = DataQualityFlag.query(aflag, start, end, url=url)
     logger.debug("Segments recovered from %s" % url)
@@ -248,32 +262,34 @@ else:
 
 
 # load unsafe channels list
-_unsafe = cp.get('safety', 'unsafe-channels')
-if os.path.isfile(_unsafe):  # from file
-    unsafe = set()
-    with open(_unsafe, 'rb') as f:
-        for c in f.read().rstrip('\n').split('\n'):
-            if c.startswith('%(IFO)s'):
-                unsafe.add(c.replace('%(IFO)s', ifo))
-            elif not c.startswith('%s:' % ifo):
-                unsafe.add('%s:%s' % (ifo, c))
-            else:
-                unsafe.add(c)
-else:  # or from line-seprated list
-    unsafe = set(_unsafe.strip('\n').split('\n'))
-unsafe.add(pchannel)
-cp.set('safety', 'unsafe-channels', '\n'.join(sorted(unsafe)))
-logger.debug("Read list of %d unsafe channels" % len(unsafe))
+if not is_safety:
+    _unsafe = cp.get('safety', 'unsafe-channels')
+    if os.path.isfile(_unsafe):  # from file
+        unsafe = set()
+        with open(_unsafe, 'rb') as f:
+            for c in f.read().rstrip('\n').split('\n'):
+                if c.startswith('%(IFO)s'):
+                    unsafe.add(c.replace('%(IFO)s', ifo))
+                elif not c.startswith('%s:' % ifo):
+                    unsafe.add('%s:%s' % (ifo, c))
+                else:
+                    unsafe.add(c)
+    else:  # or from line-seprated list
+        unsafe = set(_unsafe.strip('\n').split('\n'))
+    unsafe.add(pchannel)
+    cp.set('safety', 'unsafe-channels', '\n'.join(sorted(unsafe)))
+    logger.debug("Read list of %d unsafe channels" % len(unsafe))
 
-# remove unsafe channels
-nunsafe = 0
-for i in xrange(len(auxchannels) -1, -1, -1):
-    if auxchannels[i] in unsafe:
-        logger.warning("Auxiliary channel %r identified as unsafe and has "
-                       "been removed" % auxchannels[i])
-        auxchannels.pop(i)
-        nunsafe += 1
-logger.debug("%d auxiliary channels identified as unsafe" % nunsafe)
+    # remove unsafe channels
+    nunsafe = 0
+    for i in xrange(len(auxchannels) -1, -1, -1):
+        if auxchannels[i] in unsafe:
+            logger.warning("Auxiliary channel %r identified as unsafe and has "
+                           "been removed" % auxchannels[i])
+            auxchannels.pop(i)
+            nunsafe += 1
+    logger.debug("%d auxiliary channels identified as unsafe" % nunsafe)
+
 naux = len(auxchannels)
 logger.info("Identified %d auxiliary channels to process" % naux)
 
@@ -403,427 +419,437 @@ with open(chanfile, 'w') as f:
         print(chan, file=f)
 logger.info("Recorded list of valid auxiliary channels in %s" % chanfile)
 
-# -- execute hveto analysis ---------------------------------------------------
+if is_safety:
+    # -- run safety study on a set of injections -----------------------------
+    logger.info('safety study started')
+    r = safety_calc(cp, logger, args,
+                    primary, auxiliary, pchannel, snrs, windows, livetime ,
+                    outdir, plotdir, omegadir, inifile,
+                    safety_cutoff, safety_plot_count,
+                    ifo, start, end, analysis)
+else:
+    # -- execute hveto analysis ----------------------------------------------
 
-minsig = cp.getfloat('hveto', 'minimum-significance')
-significance = 1e9
+    minsig = cp.getfloat('hveto', 'minimum-significance')
+    significance = 1e9
 
-pevents = [primary]
-pvetoed = []
+    pevents = [primary]
+    pvetoed = []
 
-auxfcol, auxscol = auxiliary[auxchannels[0]].dtype.names[1:3]
-slabel = get_column_label(scol)
-flabel = get_column_label(fcol)
-auxslabel = get_column_label(auxscol)
-auxflabel = get_column_label(auxfcol)
+    auxfcol, auxscol = auxiliary[auxchannels[0]].dtype.names[1:3]
+    slabel = get_column_label(scol)
+    flabel = get_column_label(fcol)
+    auxslabel = get_column_label(auxscol)
+    auxflabel = get_column_label(auxfcol)
 
-rounds = []
-round = core.HvetoRound(1, pchannel)
-round.segments = analysis.active
+    rounds = []
+    round = core.HvetoRound(1, pchannel)
+    round.segments = analysis.active
 
-while True:
-    logger.info("-- Processing round %d --" % round.n)
+    while True:
+        logger.info("-- Processing round %d --" % round.n)
 
-    # write segments for this round
-    segfile = os.path.join(
-        segdir, '%s-HVETO_ANALYSIS_SEGS_ROUND_%d-%d-%d.txt'
-                % (ifo, round.n, start, duration))
-    write_ascii_segments(segfile, round.segments)
+        # write segments for this round
+        segfile = os.path.join(
+            segdir, '%s-HVETO_ANALYSIS_SEGS_ROUND_%d-%d-%d.txt'
+                    % (ifo, round.n, start, duration))
+        write_ascii_segments(segfile, round.segments)
 
-    # calculate significances for this round
-    if args.nproc > 1:  # multiprocessing
-        def _find_max_significance(channels):
-            aux = dict((c, auxiliary[c]) for c in channels)
-            return core.find_max_significance(primary, aux, pchannel,
-                                              snrs, windows, round.livetime)
-        # separate channel list into chunks and process each chunk
-        pool = multiprocessing.Pool(
-            processes=min(args.nproc, len(auxiliary.keys())))
-        chunks = utils.channel_groups(auxiliary.keys(), args.nproc)
-        results = pool.map(_find_max_significance, chunks)
-        pool.close()
-        winners, sigsets = zip(*results)
-        # find winner of chunk winners
-        winner = sorted(winners, key=lambda w: w.significance)[-1]
-        # flatten sets of significances into one list
-        newsignificances = sigsets[0]
-        for subdict in sigsets[1:]:
-            newsignificances.update(subdict)
-    else:  # single process
-        zcnt =0
-        for key in auxiliary.keys():
-            aux_val = auxiliary[key]
-            if len(aux_val) < 1:
-                zcnt += 1
-                auxiliary.pop(key, None)
-        logger.debug('%d zero len channels' % zcnt)
+        # calculate significances for this round
+        if args.nproc > 1:  # multiprocessing
+            def _find_max_significance(channels):
+                aux = dict((c, auxiliary[c]) for c in channels)
+                return core.find_max_significance(primary, aux, pchannel,
+                                                  snrs, windows, round.livetime)
+            # separate channel list into chunks and process each chunk
+            pool = multiprocessing.Pool(
+                processes=min(args.nproc, len(auxiliary.keys())))
+            chunks = utils.channel_groups(auxiliary.keys(), args.nproc)
+            results = pool.map(_find_max_significance, chunks)
+            pool.close()
+            winners, sigsets = zip(*results)
+            # find winner of chunk winners
+            winner = sorted(winners, key=lambda w: w.significance)[-1]
+            # flatten sets of significances into one list
+            newsignificances = sigsets[0]
+            for subdict in sigsets[1:]:
+                newsignificances.update(subdict)
+        else:  # single process
+            zcnt =0
+            for key in auxiliary.keys():
+                aux_val = auxiliary[key]
+                if len(aux_val) < 1:
+                    zcnt += 1
+                    auxiliary.pop(key, None)
+            logger.debug('%d zero len channels' % zcnt)
 
-        winner, newsignificances = core.find_max_significance(
-            primary, auxiliary, pchannel, snrs, windows, round.livetime)
+            winner, newsignificances = core.find_max_significance(
+                primary, auxiliary, pchannel, snrs, windows, round.livetime)
 
-    logger.info("Round %d winner: %s" % (round.n, winner.name))
+        logger.info("Round %d winner: %s" % (round.n, winner.name))
 
-    # plot significance drop here for the last round
-    #   only now do we actually have the new data to calculate significance
-    #   drop
-    if round.n > 1:
-        png = (pngname % 'SIG_DROP').replace('.png', '.svg')
-        plot.significance_drop(png, oldsignificances, newsignificances,
-                               title=title, subtitle=subtitle)
+        #    significance drop here for the last round
+        #   only now do we actually have the new data to calculate significance
+        #   drop
+        if round.n > 1:
+            png = (pngname % 'SIG_DROP').replace('.png', '.svg')
+            plot.significance_drop(png, oldsignificances, newsignificances,
+                                   title=title, subtitle=subtitle)
+            logger.debug("Figure written to %s" % png)
+            rounds[-1].plots.append(png)
+        oldsignificances = newsignificances
+
+        # break out of the loop if the significance is below the stopping point
+        if winner.significance < minsig:
+            logger.info("Maximum signifiance below stopping point")
+            logger.debug("    (%.2f < %.2f)" % (winner.significance, minsig))
+            logger.info("-- Rounds complete! --")
+            break
+
+        # work out the vetoes for this round
+        allaux = auxiliary[winner.name][
+            auxiliary[winner.name][scol] >= winner.snr]
+        winner.events = allaux
+        coincs = allaux[core.find_coincidences(allaux['time'], primary['time'],
+                                               dt=winner.window)]
+        round.vetoes = winner.get_segments(allaux['time'])
+        flag = DataQualityFlag(
+            '%s:HVT-ROUND_%d:1' % (ifo, round.n), active=round.vetoes,
+            known=round.segments,
+            description="winner=%s, window=%s, snr=%s" % (
+                winner.name, winner.window, winner.snr))
+        segments[flag.name] = flag
+        logger.debug("Generated veto segments for round %d" % round.n)
+
+        # link events before veto for plotting
+        before = primary
+        beforeaux = auxiliary[winner.name]
+
+        # apply vetoes to primary
+        primary, vetoed = core.veto(primary, round.vetoes)
+
+        pevents.append(primary)
+        pvetoed.append(vetoed)
+        logger.debug("Applied vetoes to primary")
+
+        # record results
+        round.winner = winner
+        round.efficiency = (len(vetoed), len(primary) + len(vetoed))
+        round.use_percentage = (len(coincs), len(winner.events))
+        if round.n > 1:
+            round.cum_efficiency = (
+                len(vetoed) + rounds[-1].cum_efficiency[0],
+                rounds[0].efficiency[1])
+            round.cum_deadtime = (
+                round.deadtime[0] + rounds[-1].cum_deadtime[0],
+                livetime)
+        else:
+            round.cum_efficiency = round.efficiency
+            round.cum_deadtime = round.deadtime
+
+        # apply vetoes to auxiliary
+        if args.nproc > 1:  # multiprocess
+            def _veto(channels):
+                return core.veto_all(dict((c, auxiliary[c]) for c in channels),
+                                     round.vetoes)
+            # separate channel list into chunks and process each chunk
+            pool = multiprocessing.Pool(
+                processes=min(args.nproc, len(auxiliary.keys())))
+            chunks = utils.channel_groups(auxiliary.keys(), args.nproc)
+            results = pool.map(_veto, chunks)
+            pool.close()
+            auxiliary = results[0]
+            for subdict in results[1:]:
+                auxiliary.update(subdict)
+        else:  # single process
+            auxiliary = core.veto_all(auxiliary, round.vetoes)
+        logger.debug("Applied vetoes to auxiliary channels")
+
+        # log results
+        logger.info("""Results for round %d
+    winner :          %s
+    significance :    %s
+    mu :              %s
+    snr :             %s
+    dt :              %s
+    use_percentage :  %s
+    efficiency :      %s
+    deadtime :        %s
+    cum. efficiency : %s
+    cum. deadtime :   %s""" % (
+            round.n, round.winner.name, round.winner.significance, round.winner.mu,
+            round.winner.snr, round.winner.window, round.use_percentage,
+            round.efficiency, round.deadtime, round.cum_efficiency,
+            round.cum_deadtime))
+
+        # write segments
+
+        segfile = os.path.join(segdir, '%s-HVETO_VETO_SEGS_ROUND_%d-%d-%d.txt' % (
+            ifo, round.n, start, duration))
+        write_ascii_segments(segfile, round.vetoes)
+        logger.debug("Round %d vetoes written to %s" % (round.n, segfile))
+        segxml = os.path.join(segdir, '%s-HVETO_VETO_SEGS_ROUND_%d-%d-%d.xml' % (
+            ifo, round.n, start, duration))
+        flag.write(segxml, overwrite=True)
+        logger.debug("Round %d vetoes written to %s" % (round.n, segxml))
+        round.files['VETO_SEGS'] = (segfile, segxml)
+        # write triggers
+        trigfile = os.path.join(trigdir, '%s-HVETO_%%s_TRIGS_ROUND_%d-%d-%d.txt'
+                                         % (ifo, round.n, start, duration))
+        for tag, arr in zip(
+                ['WINNER', 'VETOED', 'RAW'],
+                [winner.events, vetoed, primary]):
+            f = trigfile % tag
+            arr.write(f, format='ascii', overwrite=True)
+            logger.debug("Round %d %s events written to %s"
+                         % (round.n, tag.lower(), f))
+            round.files[tag] = f
+
+        # record times for omega scans
+        if args.omega_scans:
+            vetoed.sort(scol)
+            round.scans = vetoed[-args.omega_scans:][::-1]
+            logger.debug("Identified %d events for omega scan\n%s"
+                         % (args.omega_scans, round.scans))
+
+        # -- make some plots --
+
+        pngname = os.path.join(plotdir, '%s-HVETO_%%s_ROUND_%d-%d-%d.png' %
+            (ifo, round.n, start, duration))
+        if plot.rcParams['text.usetex']:
+            wname = round.winner.name.replace('_', r'\_')
+        else:
+            wname = round.winner.name
+        beforel = 'Before\n[%d]' % len(before)
+        afterl = 'After\n[%d]' % len(primary)
+        vetoedl = 'Vetoed\n[%d]' % len(vetoed)
+        beforeauxl = 'All\n[%d]' % len(beforeaux)
+        usedl = 'Used\n[%d]' % len(winner.events)
+        coincl = 'Coinc.\n[%d]' % len(coincs)
+        title = '%s Hveto round %d' % (ifo, round.n)
+        ptitle = '%s: primary impact' % title
+        atitle = '%s: auxiliary use' % title
+        subtitle = '[%d-%d] | winner: %s' % (start, end, wname)
+
+        # before/after histogram
+        png = pngname % 'HISTOGRAM'
+        plot.before_after_histogram(
+            png, before[scol], primary[scol],
+            label1=beforel, label2=afterl, xlabel=slabel,
+            title=ptitle, subtitle=subtitle)
         logger.debug("Figure written to %s" % png)
-        rounds[-1].plots.append(png)
-    oldsignificances = newsignificances
+        round.plots.append(png)
 
-    # break out of the loop if the significance is below the stopping point
-    if winner.significance < minsig:
-        logger.info("Maximum signifiance below stopping point")
-        logger.debug("    (%.2f < %.2f)" % (winner.significance, minsig))
-        logger.info("-- Rounds complete! --")
-        break
+        # snr versus time
+        png = pngname % 'SNR_TIME'
+        plot.veto_scatter(
+            png, before, vetoed, x='time', y=scol, label1=beforel, label2=vetoedl,
+            epoch=start, xlim=[start, end], ylabel=slabel,
+            title=ptitle, subtitle=subtitle, legend_title="Primary:")
+        logger.debug("Figure written to %s" % png)
+        round.plots.append(png)
 
-    # work out the vetoes for this round
-    allaux = auxiliary[winner.name][
-        auxiliary[winner.name][scol] >= winner.snr]
-    winner.events = allaux
-    coincs = allaux[core.find_coincidences(allaux['time'], primary['time'],
-                                           dt=winner.window)]
-    round.vetoes = winner.get_segments(allaux['time'])
-    flag = DataQualityFlag(
-        '%s:HVT-ROUND_%d:1' % (ifo, round.n), active=round.vetoes,
-        known=round.segments,
-        description="winner=%s, window=%s, snr=%s" % (
-            winner.name, winner.window, winner.snr))
-    segments[flag.name] = flag
-    logger.debug("Generated veto segments for round %d" % round.n)
+        # snr versus frequency
+        png = pngname % 'SNR_%s' % fcol.upper()
+        plot.veto_scatter(
+            png, before, vetoed, x=fcol, y=scol, label1=beforel,
+            label2=vetoedl, xlabel=flabel, ylabel=slabel, xlim=pfreq,
+            title=ptitle, subtitle=subtitle, legend_title="Primary:")
+        logger.debug("Figure written to %s" % png)
+        round.plots.append(png)
 
-    # link events before veto for plotting
-    before = primary
-    beforeaux = auxiliary[winner.name]
+        # frequency versus time coloured by SNR
+        png = pngname % '%s_TIME' % fcol.upper()
+        plot.veto_scatter(
+            png, before, vetoed, x='time', y=fcol, color=scol,
+            label1=None, label2=None, ylabel=flabel,
+            clabel=slabel, clim=[3, 100], cmap='YlGnBu',
+            epoch=start, xlim=[start, end], ylim=pfreq,
+            title=ptitle, subtitle=subtitle)
+        logger.debug("Figure written to %s" % png)
+        round.plots.append(png)
 
-    # apply vetoes to primary
-    primary, vetoed = core.veto(primary, round.vetoes)
+        # aux used versus frequency
+        png = pngname % 'USED_SNR_TIME'
+        plot.veto_scatter(
+            png, winner.events, vetoed, x='time', y=[auxscol, scol], label1=usedl,
+            label2=vetoedl, ylabel=slabel, epoch=start, xlim=[start, end],
+            title=atitle, subtitle=subtitle)
+        logger.debug("Figure written to %s" % png)
+        round.plots.append(png)
 
-    pevents.append(primary)
-    pvetoed.append(vetoed)
-    logger.debug("Applied vetoes to primary")
+        # snr versus time
+        png = pngname % 'AUX_SNR_TIME'
+        plot.veto_scatter(
+            png, beforeaux, (winner.events, coincs), x='time', y=auxscol,
+            label1=beforeauxl, label2=(usedl, coincl), epoch=start,
+            xlim=[start, end], ylabel=auxslabel, title=atitle, subtitle=subtitle)
+        logger.debug("Figure written to %s" % png)
+        round.plots.append(png)
 
-    # record results
-    round.winner = winner
-    round.efficiency = (len(vetoed), len(primary) + len(vetoed))
-    round.use_percentage = (len(coincs), len(winner.events))
-    if round.n > 1:
-        round.cum_efficiency = (
-            len(vetoed) + rounds[-1].cum_efficiency[0],
-            rounds[0].efficiency[1])
-        round.cum_deadtime = (
-            round.deadtime[0] + rounds[-1].cum_deadtime[0],
-            livetime)
-    else:
-        round.cum_efficiency = round.efficiency
-        round.cum_deadtime = round.deadtime
+        # snr versus frequency
+        png = pngname % 'AUX_SNR_FREQUENCY'
+        plot.veto_scatter(
+            png, beforeaux, (winner.events, coincs), x=auxfcol, y=auxscol,
+            label1=beforeauxl, label2=(usedl, coincl), xlabel=auxflabel,
+            ylabel=auxslabel, title=atitle, subtitle=subtitle, legend_title="Aux:")
+        logger.debug("Figure written to %s" % png)
+        round.plots.append(png)
 
-    # apply vetoes to auxiliary
-    if args.nproc > 1:  # multiprocess
-        def _veto(channels):
-            return core.veto_all(dict((c, auxiliary[c]) for c in channels),
-                                 round.vetoes)
-        # separate channel list into chunks and process each chunk
-        pool = multiprocessing.Pool(
-            processes=min(args.nproc, len(auxiliary.keys())))
-        chunks = utils.channel_groups(auxiliary.keys(), args.nproc)
-        results = pool.map(_veto, chunks)
-        pool.close()
-        auxiliary = results[0]
-        for subdict in results[1:]:
-            auxiliary.update(subdict)
-    else:  # single process
-        auxiliary = core.veto_all(auxiliary, round.vetoes)
-    logger.debug("Applied vetoes to auxiliary channels")
+        # frequency versus time coloured by SNR
+        png = pngname % 'AUX_FREQUENCY_TIME'
+        plot.veto_scatter(
+            png, beforeaux, (winner.events, coincs), x='time', y=auxfcol,
+            color=auxscol, label1=None, label2=[None, None], ylabel=auxflabel,
+            clabel=auxslabel, clim=[3, 100], cmap='YlGnBu', epoch=start,
+            xlim=[start, end], title=atitle, subtitle=subtitle)
+        logger.debug("Figure written to %s" % png)
+        round.plots.append(png)
 
-    # log results
-    logger.info("""Results for round %d
-winner :          %s
-significance :    %s
-mu :              %s
-snr :             %s
-dt :              %s
-use_percentage :  %s
-efficiency :      %s
-deadtime :        %s
-cum. efficiency : %s
-cum. deadtime :   %s""" % (
-        round.n, round.winner.name, round.winner.significance, round.winner.mu,
-        round.winner.snr, round.winner.window, round.use_percentage,
-        round.efficiency, round.deadtime, round.cum_efficiency,
-        round.cum_deadtime))
+        # move to the next round
+        rounds.append(round)
+        round = core.HvetoRound(round.n + 1, pchannel,
+                                segments=round.segments-round.vetoes)
 
-    # write segments
+    # write file with all segments
+    segfile = os.path.join(
+        segdir, '%s-HVETO_SEGMENTS-%d-%d.xml.gz' % (ifo, start, duration))
+    segments.write(segfile, overwrite=True)
+    logger.debug("Segment summary written to %s" % segfile)
 
-    segfile = os.path.join(segdir, '%s-HVETO_VETO_SEGS_ROUND_%d-%d-%d.txt' % (
-        ifo, round.n, start, duration))
-    write_ascii_segments(segfile, round.vetoes)
-    logger.debug("Round %d vetoes written to %s" % (round.n, segfile))
-    segxml = os.path.join(segdir, '%s-HVETO_VETO_SEGS_ROUND_%d-%d-%d.xml' % (
-        ifo, round.n, start, duration))
-    flag.write(segxml, overwrite=True)
-    logger.debug("Round %d vetoes written to %s" % (round.n, segxml))
-    round.files['VETO_SEGS'] = (segfile, segxml)
-    # write triggers
-    trigfile = os.path.join(trigdir, '%s-HVETO_%%s_TRIGS_ROUND_%d-%d-%d.txt'
-                                     % (ifo, round.n, start, duration))
-    for tag, arr in zip(
-            ['WINNER', 'VETOED', 'RAW'],
-            [winner.events, vetoed, primary]):
-        f = trigfile % tag
-        arr.write(f, format='ascii', overwrite=True)
-        logger.debug("Round %d %s events written to %s"
-                     % (round.n, tag.lower(), f))
-        round.files[tag] = f
+    logger.debug("Making summary figures...")
 
-    # record times for omega scans
-    if args.omega_scans:
-        vetoed.sort(scol)
-        round.scans = vetoed[-args.omega_scans:][::-1]
-        logger.debug("Identified %d events for omega scan\n%s"
-                     % (args.omega_scans, round.scans))
+    # -- exit early if no rounds above threshold
 
-    # -- make some plots --
+    if not rounds:
+        message = ("No rounds completed above threshold. Analysis stopped with "
+                   "%s achieving significance of %.2f"
+                   % (winner.name, winner.significance))
+        logger.critical(message)
+        message = message.replace(
+            winner.name, html.cis_link(winner.name, class_='alert-link'))
+        message += '<br>[T<sub>win</sub>: %ss, SNR: %s]' % (
+            winner.window, winner.snr)
+        index = html.write_null_page(ifo, start, end, message, context='warning',
+                                     **htmlv)
+        logger.info("HTML report written to %s" % index)
+        sys.exit(0)
 
-    pngname = os.path.join(plotdir, '%s-HVETO_%%s_ROUND_%d-%d-%d.png' %
-        (ifo, round.n, start, duration))
-    if plot.rcParams['text.usetex']:
-        wname = round.winner.name.replace('_', r'\_')
-    else:
-        wname = round.winner.name
-    beforel = 'Before\n[%d]' % len(before)
-    afterl = 'After\n[%d]' % len(primary)
-    vetoedl = 'Vetoed\n[%d]' % len(vetoed)
-    beforeauxl = 'All\n[%d]' % len(beforeaux)
-    usedl = 'Used\n[%d]' % len(winner.events)
-    coincl = 'Coinc.\n[%d]' % len(coincs)
-    title = '%s Hveto round %d' % (ifo, round.n)
-    ptitle = '%s: primary impact' % title
-    atitle = '%s: auxiliary use' % title
-    subtitle = '[%d-%d] | winner: %s' % (start, end, wname)
+    # -- plot all rounds impact
+    pngname = os.path.join(plotdir, '%s-HVETO_%%s_ALL_ROUNDS-%d-%d.png' %
+        (ifo, start, duration))
+    plots = []
+
+    title = '%s Hveto all rounds' % args.ifo
+    subtitle = '%d rounds | %d-%d' % (len(rounds), start, end)
 
     # before/after histogram
     png = pngname % 'HISTOGRAM'
+    beforel = 'Before analysis [%d events]' % len(pevents[0])
+    afterl = 'After %d rounds [%d]' % (len(pevents) - 1, len(pevents[-1]))
     plot.before_after_histogram(
-        png, before[scol], primary[scol],
+        png, pevents[0][scol], pevents[-1][scol],
         label1=beforel, label2=afterl, xlabel=slabel,
-        title=ptitle, subtitle=subtitle)
+        title=title, subtitle=subtitle)
+    plots.append(png)
     logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
+
+    # efficiency/deadtime curve
+    png = pngname % 'ROC'
+    plot.hveto_roc(png, rounds, title=title, subtitle=subtitle)
+    plots.append(png)
+    logger.debug("Figure written to %s" % png)
+
+    # frequency versus time
+    png = pngname % '%s_TIME' % fcol.upper()
+    labels = [str(r.n) for r in rounds]
+    legtitle = 'Vetoed at\nround'
+    plot.veto_scatter(
+        png, pevents[0], pvetoed,
+        label1='', label2=labels, title=title,
+        subtitle=subtitle, ylabel=flabel, x='time', y=fcol,
+        epoch=start, xlim=[start, end], legend_title=legtitle)
+    plots.append(png)
+    logger.debug("Figure written to %s" % png)
 
     # snr versus time
     png = pngname % 'SNR_TIME'
     plot.veto_scatter(
-        png, before, vetoed, x='time', y=scol, label1=beforel, label2=vetoedl,
-        epoch=start, xlim=[start, end], ylabel=slabel,
-        title=ptitle, subtitle=subtitle, legend_title="Primary:")
+        png, pevents[0], pvetoed, label1='', label2=labels, title=title,
+        subtitle=subtitle, ylabel=slabel, x='time', y=scol,
+        epoch=start, xlim=[start, end], legend_title=legtitle)
+    plots.append(png)
     logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
 
-    # snr versus frequency
-    png = pngname % 'SNR_%s' % fcol.upper()
-    plot.veto_scatter(
-        png, before, vetoed, x=fcol, y=scol, label1=beforel,
-        label2=vetoedl, xlabel=flabel, ylabel=slabel, xlim=pfreq,
-        title=ptitle, subtitle=subtitle, legend_title="Primary:")
-    logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
+    # -- write summary states to ASCII table and JSON
+    json_ = {
+        'user': getuser(),
+        'host': getfqdn(),
+        'date': str(datetime.datetime.now()),
+        'configuration': inifile,
+        'ifo': ifo,
+        'gpsstart': start,
+        'gpsend': end,
+        'call': ' '.join(sys.argv),
+        'rounds': [],
+    }
+    with open('summary-stats.txt', 'w') as f:
+        # print header
+        print('#N winner window SNR significance nveto use-percentage efficiency '
+              'deadtime cumulative-efficiency cumulative-deadtime', file=f)
+        for r in rounds:
+            # extract relevant statistics
+            results = [
+                ('round', r.n),
+                ('name', r.winner.name),
+                ('window', r.winner.window),
+                ('snr', r.winner.snr),
+                ('significance', r.winner.significance),
+                ('nveto', r.efficiency[0]),
+                ('use-percentage',
+                    r.use_percentage[0] / r.use_percentage[1] * 100.),
+                ('efficiency', r.efficiency[0] / r.efficiency[1] * 100.),
+                ('deadtime', r.deadtime[0] / r.deadtime[1] * 100.),
+                ('cumulative-efficiency',
+                    r.cum_efficiency[0] / r.cum_efficiency[1] * 100.),
+                ('cumulative-deadtime',
+                    r.cum_deadtime[0] / r.cum_deadtime[1] * 100.),
+            ]
+            # write to ASCII
+            print(' '.join(map(str, zip(*results)[1])), file=f)
+            # write to JSON
+            results.append(('files', r.files))
+            json_['rounds'].append(dict(results))
+    logger.debug("Summary table written to %s" % f.name)
 
-    # frequency versus time coloured by SNR
-    png = pngname % '%s_TIME' % fcol.upper()
-    plot.veto_scatter(
-        png, before, vetoed, x='time', y=fcol, color=scol,
-        label1=None, label2=None, ylabel=flabel,
-        clabel=slabel, clim=[3, 100], cmap='YlGnBu',
-        epoch=start, xlim=[start, end], ylim=pfreq,
-        title=ptitle, subtitle=subtitle)
-    logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
+    with open('summary-stats.json', 'w') as f:
+        json.dump(json_, f, sort_keys=True)
+    logger.debug("Summary JSON written to %s" % f.name)
 
-    # aux used versus frequency
-    png = pngname % 'USED_SNR_TIME'
-    plot.veto_scatter(
-        png, winner.events, vetoed, x='time', y=[auxscol, scol], label1=usedl,
-        label2=vetoedl, ylabel=slabel, epoch=start, xlim=[start, end],
-        title=atitle, subtitle=subtitle)
-    logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
+    # -- write HTML
+    index = html.write_hveto_page(ifo, start, end, rounds, plots,  **htmlv)
+    logger.debug("HTML written to %s" % index)
 
-    # snr versus time
-    png = pngname % 'AUX_SNR_TIME'
-    plot.veto_scatter(
-        png, beforeaux, (winner.events, coincs), x='time', y=auxscol,
-        label1=beforeauxl, label2=(usedl, coincl), epoch=start,
-        xlim=[start, end], ylabel=auxslabel, title=atitle, subtitle=subtitle)
-    logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
+            # -- generate workflow for omega scans
 
-    # snr versus frequency
-    png = pngname % 'AUX_SNR_FREQUENCY'
-    plot.veto_scatter(
-        png, beforeaux, (winner.events, coincs), x=auxfcol, y=auxscol,
-        label1=beforeauxl, label2=(usedl, coincl), xlabel=auxflabel,
-        ylabel=auxslabel, title=atitle, subtitle=subtitle, legend_title="Aux:")
-    logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
-
-    # frequency versus time coloured by SNR
-    png = pngname % 'AUX_FREQUENCY_TIME'
-    plot.veto_scatter(
-        png, beforeaux, (winner.events, coincs), x='time', y=auxfcol,
-        color=auxscol, label1=None, label2=[None, None], ylabel=auxflabel,
-        clabel=auxslabel, clim=[3, 100], cmap='YlGnBu', epoch=start,
-        xlim=[start, end], title=atitle, subtitle=subtitle)
-    logger.debug("Figure written to %s" % png)
-    round.plots.append(png)
-
-    # move to the next round
-    rounds.append(round)
-    round = core.HvetoRound(round.n + 1, pchannel,
-                            segments=round.segments-round.vetoes)
-
-# write file with all segments
-segfile = os.path.join(
-    segdir, '%s-HVETO_SEGMENTS-%d-%d.xml.gz' % (ifo, start, duration))
-segments.write(segfile, overwrite=True)
-logger.debug("Segment summary written to %s" % segfile)
-
-logger.debug("Making summary figures...")
-
-# -- exit early if no rounds above threshold
-
-if not rounds:
-    message = ("No rounds completed above threshold. Analysis stopped with "
-               "%s achieving significance of %.2f"
-               % (winner.name, winner.significance))
-    logger.critical(message)
-    message = message.replace(
-        winner.name, html.cis_link(winner.name, class_='alert-link'))
-    message += '<br>[T<sub>win</sub>: %ss, SNR: %s]' % (
-        winner.window, winner.snr)
-    index = html.write_null_page(ifo, start, end, message, context='warning',
-                                 **htmlv)
-    logger.info("HTML report written to %s" % index)
-    sys.exit(0)
-
-# -- plot all rounds impact
-pngname = os.path.join(plotdir, '%s-HVETO_%%s_ALL_ROUNDS-%d-%d.png' %
-    (ifo, start, duration))
-plots = []
-title = '%s Hveto all rounds' % args.ifo
-subtitle = '%d rounds | %d-%d' % (len(rounds), start, end)
-
-# before/after histogram
-png = pngname % 'HISTOGRAM'
-beforel = 'Before analysis [%d events]' % len(pevents[0])
-afterl = 'After %d rounds [%d]' % (len(pevents) - 1, len(pevents[-1]))
-plot.before_after_histogram(
-    png, pevents[0][scol], pevents[-1][scol],
-    label1=beforel, label2=afterl, xlabel=slabel,
-    title=title, subtitle=subtitle)
-plots.append(png)
-logger.debug("Figure written to %s" % png)
-
-# efficiency/deadtime curve
-png = pngname % 'ROC'
-plot.hveto_roc(png, rounds, title=title, subtitle=subtitle)
-plots.append(png)
-logger.debug("Figure written to %s" % png)
-
-# frequency versus time
-png = pngname % '%s_TIME' % fcol.upper()
-labels = [str(r.n) for r in rounds]
-legtitle = 'Vetoed at\nround'
-plot.veto_scatter(
-    png, pevents[0], pvetoed,
-    label1='', label2=labels, title=title,
-    subtitle=subtitle, ylabel=flabel, x='time', y=fcol,
-    epoch=start, xlim=[start, end], legend_title=legtitle)
-plots.append(png)
-logger.debug("Figure written to %s" % png)
-
-# snr versus time
-png = pngname % 'SNR_TIME'
-plot.veto_scatter(
-    png, pevents[0], pvetoed, label1='', label2=labels, title=title,
-    subtitle=subtitle, ylabel=slabel, x='time', y=scol,
-    epoch=start, xlim=[start, end], legend_title=legtitle)
-plots.append(png)
-logger.debug("Figure written to %s" % png)
-
-# -- write summary states to ASCII table and JSON
-json_ = {
-    'user': getuser(),
-    'host': getfqdn(),
-    'date': str(datetime.datetime.now()),
-    'configuration': inifile,
-    'ifo': ifo,
-    'gpsstart': start,
-    'gpsend': end,
-    'call': ' '.join(sys.argv),
-    'rounds': [],
-}
-with open('summary-stats.txt', 'w') as f:
-    # print header
-    print('#N winner window SNR significance nveto use-percentage efficiency '
-          'deadtime cumulative-efficiency cumulative-deadtime', file=f)
-    for r in rounds:
-        # extract relevant statistics
-        results = [
-            ('round', r.n),
-            ('name', r.winner.name),
-            ('window', r.winner.window),
-            ('snr', r.winner.snr),
-            ('significance', r.winner.significance),
-            ('nveto', r.efficiency[0]),
-            ('use-percentage',
-                r.use_percentage[0] / r.use_percentage[1] * 100.),
-            ('efficiency', r.efficiency[0] / r.efficiency[1] * 100.),
-            ('deadtime', r.deadtime[0] / r.deadtime[1] * 100.),
-            ('cumulative-efficiency',
-                r.cum_efficiency[0] / r.cum_efficiency[1] * 100.),
-            ('cumulative-deadtime',
-                r.cum_deadtime[0] / r.cum_deadtime[1] * 100.),
+    if args.omega_scans:
+        omegatimes = list(map(str, sorted(unique(
+            [t['time'] for r in rounds for t in r.scans]))))
+        logger.debug("Identified %d times for omega scan" % len(omegatimes))
+        newtimes = [t for t in omegatimes if not
+                    utils.omega_scan_complete(os.path.join(omegadir, str(t)))]
+        logger.debug("%d scans already complete, %d remaining"
+                     % (len(omegatimes) - len(newtimes), len(newtimes)))
+        logger.info('Creating workflow for omega scans...')
+        batch = ['wdq-batch'] + newtimes + [
+            '--output-dir', omegadir,
+            '--ifo', ifo,
         ]
-        # write to ASCII
-        print(' '.join(map(str, zip(*results)[1])), file=f)
-        # write to JSON
-        results.append(('files', r.files))
-        json_['rounds'].append(dict(results))
-logger.debug("Summary table written to %s" % f.name)
-
-with open('summary-stats.json', 'w') as f:
-    json.dump(json_, f, sort_keys=True)
-logger.debug("Summary JSON written to %s" % f.name)
-
-# -- write HTML
-index = html.write_hveto_page(ifo, start, end, rounds, plots,  **htmlv)
-logger.debug("HTML written to %s" % index)
-
-        # -- generate workflow for omega scans
-
-if args.omega_scans:
-    omegatimes = list(map(str, sorted(unique(
-        [t['time'] for r in rounds for t in r.scans]))))
-    logger.debug("Identified %d times for omega scan" % len(omegatimes))
-    newtimes = [t for t in omegatimes if not
-                utils.omega_scan_complete(os.path.join(omegadir, str(t)))]
-    logger.debug("%d scans already complete, %d remaining"
-                 % (len(omegatimes) - len(newtimes), len(newtimes)))
-    logger.info('Creating workflow for omega scans...')
-    batch = ['wdq-batch'] + newtimes + [
-        '--output-dir', omegadir,
-        '--ifo', ifo,
-    ]
-    proc = subprocess.Popen(batch)
-    out, err = proc.communicate()
-    if proc.returncode:
-        raise subprocess.CalledProcessError(proc.returncode, ' '.join(batch))
-    dagfile = os.path.join(omegadir, 'condor', 'wdq-batch.dag')
+        proc = subprocess.Popen(batch)
+        out, err = proc.communicate()
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, ' '.join(batch))
+        dagfile = os.path.join(omegadir, 'condor', 'wdq-batch.dag')
 
 # -- NOTE RUNTIME
 

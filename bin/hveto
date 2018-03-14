@@ -262,24 +262,24 @@ else:
 
 
 # load unsafe channels list
-if not is_safety:
-    _unsafe = cp.get('safety', 'unsafe-channels')
-    if os.path.isfile(_unsafe):  # from file
-        unsafe = set()
-        with open(_unsafe, 'rb') as f:
-            for c in f.read().rstrip('\n').split('\n'):
-                if c.startswith('%(IFO)s'):
-                    unsafe.add(c.replace('%(IFO)s', ifo))
-                elif not c.startswith('%s:' % ifo):
-                    unsafe.add('%s:%s' % (ifo, c))
-                else:
-                    unsafe.add(c)
-    else:  # or from line-seprated list
-        unsafe = set(_unsafe.strip('\n').split('\n'))
-    unsafe.add(pchannel)
-    cp.set('safety', 'unsafe-channels', '\n'.join(sorted(unsafe)))
-    logger.debug("Read list of %d unsafe channels" % len(unsafe))
+_unsafe = cp.get('safety', 'unsafe-channels')
+if os.path.isfile(_unsafe):  # from file
+    unsafe = set()
+    with open(_unsafe, 'rb') as f:
+        for c in f.read().rstrip('\n').split('\n'):
+            if c.startswith('%(IFO)s'):
+                unsafe.add(c.replace('%(IFO)s', ifo))
+            elif not c.startswith('%s:' % ifo):
+                unsafe.add('%s:%s' % (ifo, c))
+            else:
+                unsafe.add(c)
+else:  # or from line-seprated list
+    unsafe = set(_unsafe.strip('\n').split('\n'))
+unsafe.add(pchannel)
+cp.set('safety', 'unsafe-channels', '\n'.join(sorted(unsafe)))
+logger.debug("Read list of %d unsafe channels" % len(unsafe))
 
+if not is_safety:
     # remove unsafe channels
     nunsafe = 0
     for i in xrange(len(auxchannels) -1, -1, -1):
@@ -424,7 +424,7 @@ if is_safety:
     logger.info('safety study started')
     r = safety_calc(cp, logger, args,
                     primary, auxiliary, pchannel, snrs, windows, livetime ,
-                    outdir, plotdir, omegadir, inifile,
+                    outdir, plotdir, omegadir, inifile, unsafe,
                     safety_cutoff, safety_plot_count,
                     ifo, start, end, analysis)
 else:

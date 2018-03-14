@@ -23,6 +23,7 @@ from __future__ import division
 
 import sys
 import os.path
+import re
 import datetime
 import subprocess
 from functools import wraps
@@ -34,6 +35,10 @@ from _version import get_versions
 
 __author__ = 'Duncan Macleod <duncan.macleod@ligo.org>'
 __credits__ = 'Josh Smith, Joe Areeda'
+
+# for caching
+version = None
+commit = None
 
 # -- set up default JS and CSS files
 
@@ -78,6 +83,20 @@ body {
 .fancybox-skin {
 		background: white;
 }
+
+.row-us{
+    background: #def0d3;
+}
+.row-uu{
+    background: #fcf8e3;
+}
+.row-su{
+    background: #f2dede;
+}
+.row-ss{
+    background:  #d9edf7;
+}
+
 """
 
 HVETO_JS = """
@@ -198,7 +217,7 @@ def init_page(ifo, start, end, css=[], script=[], base=os.path.curdir,
         page.script('', src=f, type='text/javascript')
     # add other attributes
     for key in kwargs:
-        getattr(page, key)(kwargs[key])
+        getattr(page, key, kwargs[key])
     # finalize header
     page.head.close()
     page.body()
@@ -264,14 +283,19 @@ def wrap_html(func):
         initargs = {
             'title': '%s Hveto | %d-%d' % (ifo, start, end),
             'base': os.path.curdir,
+            'html_file': 'index.html',
         }
-        for key in ['title', 'base']:
+        for key in ['title', 'base', 'html_file']:
             if key in kwargs:
                 initargs[key] = kwargs.pop(key)
         # find outdir
         outdir = kwargs.pop('outdir', initargs['base'])
         if not os.path.isdir(outdir):
             os.makedirs(outdir)
+
+        # and filename of base html
+        fname = initargs['html_file']
+
         # write about page
         try:
             config = kwargs.pop('config')
@@ -289,14 +313,15 @@ def wrap_html(func):
         # open page
         page = init_page(ifo, start, end, **initargs)
         # write content
-        contentf = os.path.join(outdir, '_inner.html')
+        ifname = re.sub('.html', '-inner.html', fname)
+        contentf = os.path.join(outdir, ifname)
         with open(contentf, 'w') as f:
             f.write(str(func(*args, **kwargs)))
         # embed content
         page.div('', id_='content')
         page.script("$('#content').load('%s');" % contentf)
         # close page
-        index = os.path.join(outdir, 'index.html')
+        index = os.path.join(outdir, fname)
         close_page(page, index, about=about)
         return index
     return decorated_func
@@ -455,6 +480,9 @@ def write_footer(about=None, date=None):
     page : `~glue.markup.page`
         the markup object containing the footer HTML
     """
+
+    global version, commit
+
     page = markup.page()
     page.twotags.append('footer')
     markup.element('footer', case=page.case, parent=page)(class_='footer')
@@ -462,8 +490,6 @@ def write_footer(about=None, date=None):
     # write user/time for analysis
     if date is None:
         date = datetime.datetime.now().replace(second=0, microsecond=0)
-    version = get_versions()['version']
-    commit = get_versions()['full-revisionid']
     url = 'https://github.com/hveto/hveto/tree/%s' % commit
     hlink = markup.oneliner.a('Hveto version %s' % version, href=url,
                               target='_blank')
@@ -745,7 +771,7 @@ def write_null_page(reason, context='info'):
 
 
 @wrap_html
-def write_about_page(configfile):
+def write_about_page(configfile, **kwargs):
     """Write a page explaining how an hveto analysis was completed
 
     Parameters
@@ -773,3 +799,10 @@ def write_about_page(configfile):
     page.pre(write_config_html(configfile))
     return page
 
+def versions():
+    """Only reach out to github once"""
+    global version, commit
+
+    if not version or not commit:
+        version = get_versions()['version']
+        commit = get_versions()['full-revisionid']

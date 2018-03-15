@@ -426,7 +426,7 @@ if is_safety:
                     primary, auxiliary, pchannel, snrs, windows, livetime ,
                     outdir, plotdir, omegadir, inifile, unsafe,
                     safety_cutoff, safety_plot_count,
-                    ifo, start, end, analysis)
+                    ifo, start, end, analysis, jobstart)
 else:
     # -- execute hveto analysis ----------------------------------------------
 

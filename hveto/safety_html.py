@@ -169,9 +169,9 @@ def write_safety_round(round, thresh):
         panel_bkg = 'panel-info'
         safety_status = 'Safe - safe'
 
-    page.div(class_='panel panel-info', id_='hveto-round-%d' % round.n)
+    page.div(class_='panel ' + panel_bkg, id_='hveto-round-%d' % round.n)
     # -- make heading
-    page.div(class_='panel-heading clearfix')
+    page.div(class_='panel-heading clearfix ' + panel_bkg)
     # link to top of page
     page.div(class_='pull-right')
     page.a("<small>[top]</small>", href='#')
@@ -179,7 +179,7 @@ def write_safety_round(round, thresh):
     # heading
     page.h3('Round %d, channel = %s, window = %s, SNR thresh = %s, significane = %.1f'
             % (round.n, round.winner.name, round.winner.window,
-               round.winner.snr, round.winner.significance), class_='panel-title' + panel_bkg)
+               round.winner.snr, round.winner.significance), class_='panel-title ' + panel_bkg)
     page.div.close()  # panel-heading
 
     # -- make body
@@ -205,7 +205,6 @@ def write_safety_round(round, thresh):
         pc = 0.
     page.add(bold_param('Efficiency',
                         ('%.2f [%d/%d]' % (pc, round.efficiency[0], round.efficiency[1]))))
-    page.add(bold_param('Efficiency', round.efficiency))
 
     try:
         pc = round.deadtime[0] / round.deadtime[1] * 100.

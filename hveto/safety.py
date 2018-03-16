@@ -95,23 +95,25 @@ def safety_calc(cp, logger, args,
                 allaux = auxiliary[chan][auxiliary[chan][scol] >= snr]
                 coinc1 = allaux[find_coincidences(allaux['time'], primary['time'], dt=dt)]
 
-                trig_cnt = len(coincs)
+                trig_cnt = len(coinc1)
                 sig = significance(trig_cnt, mu)
             except KeyError:
                 sig == 0
-            # save vals for every channel. here everyone is a winner
-            chan_stat = HvetoWinner(name=chan)
 
-            chan_stat.snr = snr
-            chan_stat.window = dt
-            chan_stat.significance = sig
-            chan_stat.mu = mu
-            chan_stat.ncoinc = trig_cnt
+            if trig_cnt > 0:
+                # save vals for every channel. here everyone is a winner
+                chan_stat = HvetoWinner(name=chan)
 
-            chan_stats.append(chan_stat)
+                chan_stat.snr = snr
+                chan_stat.window = dt
+                chan_stat.significance = sig
+                chan_stat.mu = mu
+                chan_stat.ncoinc = trig_cnt
+
+                chan_stats.append(chan_stat)
 
     # sort by significance
-    chan_stats.sort(key=lambda x: x.significance, reverse=True)
+    chan_stats = sorted(chan_stats, key=lambda x: x.significance, reverse=True)
 
     # ascii results
     sum_file = outdir + "/safety_summary.csv"
@@ -121,7 +123,6 @@ def safety_calc(cp, logger, args,
         # CSV column name
         vals = 'chan, significance, N-coinc, N-expected, '
         vals += 'N-aux, N-coinc/N-expected, SNR, dT '
-        vals += ('primary channel: %d triggers' % len(primary))
         print(vals, file=f)
 
         for cs in chan_stats:
@@ -136,7 +137,7 @@ def safety_calc(cp, logger, args,
             except KeyError:
                 sig == 0
 
-            if trig_cnt > 0:
+            if sig > safety_min:
                 cs.ncoinc = trig_cnt
                 cs.significance = sig
                 chan_num += 1
@@ -145,13 +146,14 @@ def safety_calc(cp, logger, args,
                 dup_str = ''
                 if len(dups) > 0:
                     dup_str = ','.join(map(str,coincs['gpstime']))
+
                 vals = '%s,%.3f,%d,%.3f,%.0f,%.4f,%.1f,%.2f,%s' %\
                        (name, cs.significance, cs.ncoinc, cs.mu,
                         len(allaux), cs.ncoinc / cs.mu, cs.snr, cs.window, dup_str)
                 print(vals, file=f)
 
                 # process as if it were a round winner
-                if cs.significance > safety_cutoff:
+                if cs.significance > safety_min:
                     round = HvetoRound(chan_num, primary)
                     round.segments = analysis.active
                     # work out the vetoes for this round
